@@ -1,7 +1,10 @@
 const express = require('express')
 const instrument = require('../lib/instrument-middleware')
+const haltOnDroppedConnection = require('./halt-on-dropped-connection')
 
-const isDevelopment = process.env.NODE_ENV === 'development'
+const { NODE_ENV } = process.env
+const isDevelopment = NODE_ENV === 'development'
+const isTest = NODE_ENV === 'test' || process.env.GITHUB_ACTIONS === 'true'
 
 // Catch unhandled promise rejections and passing them to Express's error handler
 // https://medium.com/@Abazhenov/using-async-await-in-express-with-node-8-b8af872c0016
@@ -11,6 +14,10 @@ const asyncMiddleware = fn =>
   }
 
 module.exports = function (app) {
+  // *** Request connection management ***
+  if (!isTest) app.use(require('./timeout'))
+  app.use(require('./abort'))
+
   // *** Development tools ***
   app.use(require('morgan')('dev', { skip: (req, res) => !isDevelopment }))
   if (isDevelopment) app.use(require('./webpack'))
@@ -29,8 +36,14 @@ module.exports = function (app) {
 
   // *** Security ***
   app.use(require('./cors'))
-  app.use(require('./csp')) // Must come before helmet
-  app.use(require('helmet')())
+  app.use(require('helmet')({
+    // Override referrerPolicy to match the browser's default: "strict-origin-when-cross-origin".
+    // Helmet now defaults to "no-referrer", which is a problem for our archived assets proxying.
+    referrerPolicy: {
+      policy: 'strict-origin-when-cross-origin'
+    }
+  }))
+  app.use(require('./csp')) // Must come after helmet
   app.use(require('./cookie-parser')) // Must come before csrf
   app.use(express.json()) // Must come before csrf
   app.use(require('./csrf'))
@@ -41,12 +54,14 @@ module.exports = function (app) {
   app.use(require('compression')())
   app.use(require('./disable-caching-on-safari'))
   app.use(require('./set-fastly-surrogate-key'))
+  app.use(require('./catch-bad-accept-language'))
 
   // *** Config and context for redirects ***
   app.use(require('./req-utils')) // Must come before record-redirect and events
   app.use(require('./record-redirect'))
   app.use(instrument('./detect-language')) // Must come before context, breadcrumbs, find-page, handle-errors, homepages
   app.use(asyncMiddleware(instrument('./context'))) // Must come before early-access-*, handle-redirects
+  app.use(asyncMiddleware(instrument('./contextualizers/short-versions'))) // Support version shorthands
 
   // *** Redirects, 3xx responses ***
   // I ordered these by use frequency
@@ -57,12 +72,15 @@ module.exports = function (app) {
   app.use(instrument('./redirects/handle-redirects')) // Must come before contextualizers
 
   // *** Config and context for rendering ***
-  app.use(instrument('./find-page')) // Must come before archived-enterprise-versions, breadcrumbs, featured-links, products, render-page
+  app.use(asyncMiddleware(instrument('./find-page'))) // Must come before archived-enterprise-versions, breadcrumbs, featured-links, products, render-page
   app.use(instrument('./block-robots'))
+
+  // Check for a dropped connection before proceeding
+  app.use(haltOnDroppedConnection)
 
   // *** Rendering, 2xx responses ***
   // I largely ordered these by use frequency
-  app.use(instrument('./archived-enterprise-versions-assets')) // Must come before static/assets
+  app.use(asyncMiddleware(instrument('./archived-enterprise-versions-assets'))) // Must come before static/assets
   app.use('/dist', express.static('dist', {
     index: false,
     etag: false,
@@ -82,31 +100,50 @@ module.exports = function (app) {
     lastModified: false,
     maxAge: '7 days' // A bit longer since releases are more sparse
   }))
-  app.use('/events', instrument('./events'))
-  app.use('/search', instrument('./search'))
-  app.use(instrument('./archived-enterprise-versions'))
+  app.use('/events', asyncMiddleware(instrument('./events')))
+  app.use('/search', asyncMiddleware(instrument('./search')))
+  app.use(asyncMiddleware(instrument('./archived-enterprise-versions')))
   app.use(instrument('./robots'))
   app.use(/(\/.*)?\/early-access$/, instrument('./contextualizers/early-access-links'))
-  app.use(instrument('./categories-for-support-team'))
+  app.use('/categories.json', asyncMiddleware(instrument('./categories-for-support')))
   app.use(instrument('./loaderio-verification'))
   app.get('/_500', asyncMiddleware(instrument('./trigger-error')))
 
-  // *** Preparation for render-page ***
-  app.use(asyncMiddleware(instrument('./contextualizers/enterprise-release-notes')))
+  // Check for a dropped connection before proceeding (again)
+  app.use(haltOnDroppedConnection)
+
+  // *** Preparation for render-page: contextualizers ***
+  app.use(asyncMiddleware(instrument('./contextualizers/release-notes')))
   app.use(instrument('./contextualizers/graphql'))
   app.use(instrument('./contextualizers/rest'))
   app.use(instrument('./contextualizers/webhooks'))
-  app.use(instrument('./breadcrumbs'))
-  app.use(instrument('./early-access-breadcrumbs'))
-  app.use(instrument('./enterprise-server-releases'))
-  app.use(instrument('./dev-toc'))
-  app.use(instrument('./featured-links'))
-  app.use(instrument('./learning-track'))
+  app.use(asyncMiddleware(instrument('./contextualizers/whats-new-changelog')))
+  app.use(instrument('./contextualizers/layout'))
+  app.use(instrument('./contextualizers/current-product-tree'))
+  app.use(asyncMiddleware(instrument('./contextualizers/generic-toc')))
+  app.use(asyncMiddleware(instrument('./contextualizers/breadcrumbs')))
+  app.use(asyncMiddleware(instrument('./contextualizers/early-access-breadcrumbs')))
+  app.use(asyncMiddleware(instrument('./contextualizers/product-examples')))
+
+  app.use(asyncMiddleware(instrument('./dev-toc')))
+  app.use(asyncMiddleware(instrument('./featured-links')))
+  app.use(asyncMiddleware(instrument('./learning-track')))
+  app.use(asyncMiddleware(instrument('./is-next-request')))
 
   // *** Headers for pages only ***
   app.use(require('./set-fastly-cache-headers'))
 
-  // *** Rendering, must go last ***
+  // handle serving NextJS bundled code (/_next/*)
+  if (process.env.FEATURE_NEXTJS) {
+    app.use(instrument('./next'))
+  }
+
+  // Check for a dropped connection before proceeding (again)
+  app.use(haltOnDroppedConnection)
+
+  // *** Rendering, must go almost last ***
   app.get('/*', asyncMiddleware(instrument('./render-page')))
+
+  // *** Error handling, must go last ***
   app.use(require('./handle-errors'))
 }
